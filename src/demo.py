@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from omegaconf import DictConfig, OmegaConf
 from model import build_pointing_network
 from draw_arrow import WIDTH, HEIGHT
-
+from mmdet.apis import inference_detector, init_detector
 
 @hydra.main(version_base=None, config_path="../conf", config_name="base")
 def main(cfg: DictConfig) -> None:
@@ -47,7 +47,6 @@ def main(cfg: DictConfig) -> None:
 
     network = build_pointing_network(cfg, DEVICE)
 
-    # Since the model trained using pytorch lightning contains `model.` as an prefix to the keys of state_dict, we should remove them before loading
     model_dict = torch.load(cfg.ckpt)["state_dict"]
     new_model_dict = dict()
     for k, v in model_dict.items():
@@ -55,6 +54,9 @@ def main(cfg: DictConfig) -> None:
     model_dict = new_model_dict
     network.load_state_dict(model_dict)
     network.to(DEVICE)
+
+    # Initialize MMDetection model for object detection
+    detector = init_detector(cfg.obj_detect_cfg_file, cfg.obj_detect_checkpoint_file, device=DEVICE)
 
     Path("demo").mkdir(exist_ok=True)
     fps = 15
@@ -75,7 +77,7 @@ def main(cfg: DictConfig) -> None:
 
     for batch in tqdm(dl):
         result = network(batch)
-        # bs may be smaller than cfg.hardware.bs for the last iteration
+        
         bs = batch["abs_joint_position"].shape[0]
         for i_bs in range(bs):
             joints = batch["abs_joint_position"][i_bs][-1].to("cpu").numpy()
@@ -136,14 +138,33 @@ def main(cfg: DictConfig) -> None:
                 ),
             )
 
-            cv2.imshow("", image_green)
+            # Perform object detection using MMDetection
+            obj_detection_results = inference_detector(detector, image)
+            # Compute the closest object to the arrow
+            closest_object = compute_closest_object(obj_detection_results, direction, arrow_base)
+            
+            # Process detection results as needed
+            # For example, you can filter out detections based on confidence scores
+            
+            # Visualize detection results on the image
+            for class_id, class_result in enumerate(obj_detection_results):
+                for obj in class_result:
+                    if obj[4] > 0.5:  # Adjust threshold as needed
+                        bbox = obj[:4].astype(np.int32)
+                        cv2.rectangle(image, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
+                        class_name = MetadataCatalog.get(cfg_obj_detect.DATASETS.TRAIN[0]).thing_classes[class_id]
+                        cv2.putText(image, class_name, (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+            # You can use MMDetection's visualization tools or customize as needed
+            # For example, you can draw bounding boxes and labels directly using OpenCV
+            
+            cv2.imshow("", image)
             cv2.waitKey(10)
 
             out_green.write((image_green * 255).astype(np.uint8))
             out_greenred.write((image_greenred * 255).astype(np.uint8))
 
     return
-
 
 def draw_arrow_on_image(image, arrow_spec, kwargs):
     """
@@ -161,6 +182,22 @@ def draw_arrow_on_image(image, arrow_spec, kwargs):
     ret_image = arrow_mask * ret_image + (1 - arrow_mask) * img_arrow
     return ret_image
 
+def compute_closest_object(instances, direction, arrow_base):
+    min_distance = float('inf')
+    closest_object = None
+    direction_vec = np.array([direction[0].cpu(), direction[1].cpu(), direction[2].cpu()])
+
+    for instance in instances:
+        bbox = instance.pred_boxes.tensor[0].cpu().numpy()
+        object_position = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2])
+        object_direction_vec = object_position - arrow_base[:2]  
+        distance = np.linalg.norm(object_direction_vec - direction_vec)
+
+        if distance < min_distance:
+            min_distance = distance
+            closest_object = instance
+
+    return closest_object
 
 if __name__ == "__main__":
     main()
